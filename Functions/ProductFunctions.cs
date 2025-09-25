@@ -18,6 +18,7 @@ namespace Part2FunctionApp.Functions
         private readonly TableStorageService<Product> _productTableService;
         private readonly BlobStorageService _blobStorageService;
         private readonly QueueStorageService _queueStorageService;
+        private const string PARTITION_KEY = "Product";
 
         public ProductFunctions(TableStorageService<Product> productTableService, BlobStorageService blobStorageService, QueueStorageService queueStorageService)
         {
@@ -69,7 +70,7 @@ namespace Part2FunctionApp.Functions
 
             try
             {
-                var product = await _productTableService.GetEntityAsync("Product", productId);
+                var product = await _productTableService.GetEntityAsync(PARTITION_KEY, productId);
 
                 if(product == null)
                 {
@@ -94,19 +95,18 @@ namespace Part2FunctionApp.Functions
 
             //Read form data
             var formData = await req.ReadFormAsync();
-            var partitionKey = "Product";
             var rowKey = Guid.NewGuid().ToString();
 
             var product = new Product
             {
-                PartitionKey = partitionKey,
+                PartitionKey = PARTITION_KEY,
                 RowKey = rowKey,
                 Name = formData["name"],
                 Description = formData["description"],
                 Price = int.TryParse(formData["price"], out var price) ? price : 0,
             };
 
-            log.LogInformation($"Creating student with partitionkey: {partitionKey}, rowkey: {rowKey}");
+            log.LogInformation($"Creating student with partitionkey: {PARTITION_KEY}, rowkey: {rowKey}");
 
             // handle your photo if uploaded
             var imageFile = formData.Files.FirstOrDefault();
@@ -164,7 +164,7 @@ namespace Part2FunctionApp.Functions
             var price = int.Parse(priceString);
 
             // Retrieve the existing product
-            var existingProduct = await _productTableService.GetEntityAsync("Product", productId);
+            var existingProduct = await _productTableService.GetEntityAsync(PARTITION_KEY, productId);
             if (existingProduct == null)
             {
                 log.LogWarning($"Product with RowKey {productId} not found.");
