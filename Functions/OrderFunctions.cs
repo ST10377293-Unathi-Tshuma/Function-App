@@ -21,6 +21,7 @@ namespace Part2FunctionApp.Functions
         private readonly TableStorageService<Product> _productTableService;
         private readonly BlobStorageService _blobStorageService;
         private readonly QueueStorageService _queueStorageService;
+        private readonly AuthService authService;
 
         public OrderFunctions(
             TableStorageService<Order> orderTableService,

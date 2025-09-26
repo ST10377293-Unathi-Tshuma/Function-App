@@ -4,6 +4,7 @@ using Microsoft.Azure.WebJobs;
 using Microsoft.Azure.WebJobs.Extensions.Http;
 using Microsoft.Extensions.Logging;
 using Newtonsoft.Json;
+using Part2FunctionApp.Helpers;
 using Part2FunctionApp.Models;
 using Part2FunctionApp.Services;
 using System;
@@ -18,13 +19,15 @@ namespace Part2FunctionApp.Functions
         private readonly TableStorageService<Product> _productTableService;
         private readonly BlobStorageService _blobStorageService;
         private readonly QueueStorageService _queueStorageService;
+        private readonly AuthService _authService;
         private const string PARTITION_KEY = "Product";
 
-        public ProductFunctions(TableStorageService<Product> productTableService, BlobStorageService blobStorageService, QueueStorageService queueStorageService)
+        public ProductFunctions(TableStorageService<Product> productTableService, BlobStorageService blobStorageService, QueueStorageService queueStorageService, AuthService authService)
         {
             _productTableService = productTableService;
             _blobStorageService = blobStorageService;
             _queueStorageService = queueStorageService;
+            _authService = authService;
         }
 
         [FunctionName("GetProducts")]
@@ -93,6 +96,19 @@ namespace Part2FunctionApp.Functions
         {
             log.LogInformation("Processing product creation request");
 
+            //Authorization Check -- Require Manager role or higher
+            var (authorized, user, errorResult) = AuthorizationHelper.AuthorizeRequest(
+                req, _authService, "Manager", log
+                );
+
+            if (!authorized)
+            {
+                log.LogWarning("Unathorized attempt to create product");
+                return errorResult;
+            }
+
+            log.LogInformation($"Manager/Admin {user.Username} ({user.Role}) creating product");
+
             //Read form data
             var formData = await req.ReadFormAsync();
             var rowKey = Guid.NewGuid().ToString();
@@ -133,7 +149,10 @@ namespace Part2FunctionApp.Functions
                     ProductId = product.RowKey,
                     product.Name,
                     product.Price,
-                    HasImage = !string.IsNullOrEmpty(product.ImageUrl)
+                    HasImage = !string.IsNullOrEmpty(product.ImageUrl),
+                    createdBy = user.Username, 
+                    CreatedByRole = user.Role,
+                    CreatedByUserId = user.UserId,
                 })
             };
             await _queueStorageService.SendLogEntryAsync(auditLog);
@@ -155,6 +174,17 @@ namespace Part2FunctionApp.Functions
             ILogger log)
         {
             log.LogInformation($"Processing request to update product with PartitionKey: Product, RowKey: {productId}");
+
+            var (authorized, user, errorResult) = AuthorizationHelper.AuthorizeRequest(
+                req, _authService, "Manager", log);
+            if (!authorized)
+            {
+                log.LogWarning($"Unauthorized attempt to update product {productId}");
+                return errorResult;
+            }
+
+            log.LogInformation($"Manager/Admin {user.Username} ({user.Role}) updating product {productId}");
+
 
             // Read form data
             var formData = await req.ReadFormAsync();
@@ -207,7 +237,20 @@ namespace Part2FunctionApp.Functions
             {
                 TableName = "Products",
                 Action = "Update",
-                DataSnapshot = JsonConvert.SerializeObject(updatedProductDto),
+                DataSnapshot = JsonConvert.SerializeObject(new
+                {
+                    ProductId = productId,
+                    UpdatedFields = new
+                    {
+                        Name = !string.IsNullOrEmpty(name),
+                        Description = !string.IsNullOrEmpty(description),
+                        Price = int.TryParse(priceString, out _),
+                        ImageUpdated = formData.Files.Count > 0
+                    },
+                    UpdatedBy = user.Username,
+                    UpdatedByRole = user.Role,
+                    UpdatedByUserId = user.UserId
+                }),
                 Timestamp = DateTime.UtcNow
             };
             await _queueStorageService.SendLogEntryAsync(audit);
@@ -223,6 +266,17 @@ namespace Part2FunctionApp.Functions
             ILogger log)
         {
             log.LogInformation($"Processing request to delete product with PartitionKey: Product, RowKey: {productId}");
+
+            // AUTHORIZATION CHECK - Require Admin role
+            var (authorized, user, errorResult) = AuthorizationHelper.AuthorizeRequest(
+                req, _authService, "Admin", log);
+            if (!authorized)
+            {
+                log.LogWarning($"Unauthorized attempt to delete product {productId}");
+                return errorResult;
+            }
+
+            log.LogInformation($"Admin {user.Username} deleting product {productId}");
 
             if (string.IsNullOrWhiteSpace(productId))
             {
@@ -253,8 +307,12 @@ namespace Part2FunctionApp.Functions
                 DataSnapshot = JsonConvert.SerializeObject(new
                 {
                     ProductId = existingProduct.RowKey,
-                    existingProduct.Name,
-                    existingProduct.Price
+                    ProductName = existingProduct.Name,
+                    Price = existingProduct.Price,
+                    ImageDeleted = !string.IsNullOrEmpty(existingProduct.ImageUrl),
+                    DeletedBy = user.Username,
+                    DeletedByRole = user.Role,
+                    DeletedByUserId = user.UserId
                 }),
                 Timestamp = DateTime.UtcNow
             };
