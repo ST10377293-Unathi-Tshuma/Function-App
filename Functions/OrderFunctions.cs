@@ -21,7 +21,6 @@ namespace Part2FunctionApp.Functions
         private readonly TableStorageService<Product> _productTableService;
         private readonly BlobStorageService _blobStorageService;
         private readonly QueueStorageService _queueStorageService;
-        private readonly AuthService authService;
 
         public OrderFunctions(
             TableStorageService<Order> orderTableService,
@@ -37,12 +36,13 @@ namespace Part2FunctionApp.Functions
             _queueStorageService = queueStorageService;
         }
 
+        // MANAGER+ ONLY - View all orders
         [FunctionName("GetOrders")]
         public async Task<IActionResult> GetOrders(
             [HttpTrigger(AuthorizationLevel.Anonymous, "get", Route = "orders")] HttpRequest req,
             ILogger log)
         {
-            log.LogInformation("Retrieving all orders");
+            log.LogInformation("Processing request to retrieve all orders");
 
             try
             {
@@ -75,7 +75,11 @@ namespace Part2FunctionApp.Functions
                     orderViewModels.Add(orderViewModel);
                 }
 
-                return new OkObjectResult(orderViewModels);
+                return new OkObjectResult(new
+                {
+                    message = $"Retrieved {orderViewModels.Count} orders",
+                    orders = orderViewModels,
+                });
             }
             catch (Exception ex)
             {
@@ -84,6 +88,7 @@ namespace Part2FunctionApp.Functions
             }
         }
 
+        // CUSTOMER: View own orders, MANAGER+: View any order
         [FunctionName("GetOrder")]
         public async Task<IActionResult> GetOrder(
             [HttpTrigger(AuthorizationLevel.Anonymous, "get", Route = "orders/{orderId}")] HttpRequest req,
@@ -132,6 +137,7 @@ namespace Part2FunctionApp.Functions
             }
         }
 
+        // CUSTOMER: Create orders (own only), MANAGER+: Create orders for any customer
         [FunctionName("CreateOrder")]
         public async Task<IActionResult> CreateOrder(
             [HttpTrigger(AuthorizationLevel.Anonymous, "post", Route = "orders")] HttpRequest req,
@@ -141,29 +147,32 @@ namespace Part2FunctionApp.Functions
 
             try
             {
-                var form = await req.ReadFormAsync();
-                var customerId = form["customerId"];
-                var productId = form["productId"];
+                string requestBody = await new StreamReader(req.Body).ReadToEndAsync();
+                var orderRequest = JsonConvert.DeserializeObject<CreateOrderRequest>(requestBody);
 
-                if (string.IsNullOrWhiteSpace(customerId) || string.IsNullOrWhiteSpace(productId))
+                // Validation
+                if (orderRequest == null ||
+                    string.IsNullOrWhiteSpace(orderRequest.CustomerId) ||
+                    string.IsNullOrWhiteSpace(orderRequest.ProductId))
                 {
+                    log.LogWarning("Invalid order request. CustomerId and ProductId are required.");
                     return new BadRequestObjectResult("CustomerId and ProductId are required.");
                 }
 
                 // Verify customer exists
-                var customer = await _customerTableService.GetEntityAsync("Customer", customerId);
+                var customer = await _customerTableService.GetEntityAsync("Customer", orderRequest.CustomerId);
                 if (customer == null)
                 {
-                    log.LogWarning("Customer with ID {customerId} not found.", customerId);
-                    return new BadRequestObjectResult($"Customer with ID {customerId} not found.");
+                    log.LogWarning("Customer with ID {customerId} not found.", orderRequest.CustomerId);
+                    return new BadRequestObjectResult($"Customer with ID {orderRequest.CustomerId} not found.");
                 }
 
                 // Verify product exists
-                var product = await _productTableService.GetEntityAsync("Product", productId);
+                var product = await _productTableService.GetEntityAsync("Product", orderRequest.ProductId);
                 if (product == null)
                 {
-                    log.LogWarning("Product with ID {productId} not found.", productId);
-                    return new BadRequestObjectResult($"Product with ID {productId} not found.");
+                    log.LogWarning("Product with ID {productId} not found.", orderRequest.ProductId);
+                    return new BadRequestObjectResult($"Product with ID {orderRequest.ProductId} not found.");
                 }
 
                 // Create order
@@ -171,8 +180,8 @@ namespace Part2FunctionApp.Functions
                 {
                     PartitionKey = "Order",
                     RowKey = Guid.NewGuid().ToString(),
-                    CustomerId = customerId,
-                    ProductId = productId,
+                    CustomerId = orderRequest.CustomerId,
+                    ProductId = orderRequest.ProductId,
                     Status = "Processing"
                 };
 
@@ -181,7 +190,7 @@ namespace Part2FunctionApp.Functions
                 // Save order to table storage
                 await _orderTableService.UpsertEntityAsync(order);
 
-                // Send audit log to queue
+                // Enhanced audit log with user information
                 var auditLog = new AuditLog
                 {
                     TableName = "Orders",
@@ -193,7 +202,7 @@ namespace Part2FunctionApp.Functions
                         CustomerName = customer.FullName,
                         ProductId = order.ProductId,
                         ProductName = product.Name,
-                        Status = order.Status
+                        Status = order.Status,
                     })
                 };
                 await _queueStorageService.SendLogEntryAsync(auditLog);
@@ -205,7 +214,7 @@ namespace Part2FunctionApp.Functions
                     orderId = order.RowKey,
                     customerId = order.CustomerId,
                     productId = order.ProductId,
-                    status = order.Status
+                    status = order.Status,
                 });
             }
             catch (Exception ex)
@@ -215,11 +224,12 @@ namespace Part2FunctionApp.Functions
             }
         }
 
+        // MANAGER+ ONLY - Update order status
         [FunctionName("UpdateOrderStatus")]
         public async Task<IActionResult> UpdateOrderStatus(
-    [HttpTrigger(AuthorizationLevel.Anonymous, "put", Route = "orders/{orderId}/status")] HttpRequest req,
-    string orderId,
-    ILogger log)
+            [HttpTrigger(AuthorizationLevel.Anonymous, "put", Route = "orders/{orderId}/status")] HttpRequest req,
+            string orderId,
+            ILogger log)
         {
             log.LogInformation($"Processing request to update order status for OrderId: {orderId}");
 
@@ -230,18 +240,17 @@ namespace Part2FunctionApp.Functions
 
             try
             {
-                var form = await req.ReadFormAsync();
-                var status = form["status"].ToString();
-                var updatedBy = string.IsNullOrWhiteSpace(form["updatedBy"]) ? "System" : form["updatedBy"].ToString();
+                string requestBody = await new StreamReader(req.Body).ReadToEndAsync();
+                var statusUpdate = JsonConvert.DeserializeObject<UpdateOrderStatusRequest>(requestBody);
 
-                if (string.IsNullOrWhiteSpace(status))
+                if (statusUpdate == null || string.IsNullOrWhiteSpace(statusUpdate.Status))
                 {
                     return new BadRequestObjectResult("Status is required.");
                 }
 
                 // Validate status values
                 var validStatuses = new[] { "Processing", "Confirmed", "Shipped", "Delivered", "Cancelled" };
-                if (!validStatuses.Contains(status, StringComparer.OrdinalIgnoreCase))
+                if (!validStatuses.Contains(statusUpdate.Status))
                 {
                     return new BadRequestObjectResult($"Invalid status. Valid statuses: {string.Join(", ", validStatuses)}");
                 }
@@ -255,12 +264,12 @@ namespace Part2FunctionApp.Functions
                 }
 
                 var oldStatus = existingOrder.Status;
-                existingOrder.Status = status;
+                existingOrder.Status = statusUpdate.Status;
 
                 // Update order in table storage
                 await _orderTableService.UpsertEntityAsync(existingOrder);
 
-                // Send audit log to queue
+                // Enhanced audit log
                 var auditLog = new AuditLog
                 {
                     TableName = "Orders",
@@ -269,21 +278,18 @@ namespace Part2FunctionApp.Functions
                     {
                         OrderId = orderId,
                         OldStatus = oldStatus,
-                        NewStatus = status,
-                        UpdatedBy = updatedBy
+                        NewStatus = statusUpdate.Status,
                     })
                 };
                 await _queueStorageService.SendLogEntryAsync(auditLog);
-
-                log.LogInformation($"Order {orderId} status updated from {oldStatus} to {status}");
 
                 return new OkObjectResult(new
                 {
                     success = true,
                     message = "Order status updated successfully",
-                    orderId,
-                    oldStatus,
-                    newStatus = status
+                    orderId = orderId,
+                    oldStatus = oldStatus,
+                    newStatus = statusUpdate.Status,
                 });
             }
             catch (Exception ex)
@@ -293,7 +299,7 @@ namespace Part2FunctionApp.Functions
             }
         }
 
-
+        // CUSTOMER: Cancel own orders, MANAGER+: Cancel any order
         [FunctionName("CancelOrder")]
         public async Task<IActionResult> CancelOrder(
             [HttpTrigger(AuthorizationLevel.Anonymous, "delete", Route = "orders/{orderId}")] HttpRequest req,
@@ -333,7 +339,7 @@ namespace Part2FunctionApp.Functions
                 // Alternative: Actually delete the order (uncomment if preferred)
                 // await _orderTableService.DeleteEntityAsync(existingOrder.PartitionKey, existingOrder.RowKey);
 
-                // Send audit log to queue
+                // Enhanced audit log
                 var auditLog = new AuditLog
                 {
                     TableName = "Orders",
@@ -343,19 +349,17 @@ namespace Part2FunctionApp.Functions
                         OrderId = orderId,
                         PreviousStatus = oldStatus,
                         CustomerId = existingOrder.CustomerId,
-                        ProductId = existingOrder.ProductId
+                        ProductId = existingOrder.ProductId,
                     })
                 };
                 await _queueStorageService.SendLogEntryAsync(auditLog);
-
-                log.LogInformation($"Order {orderId} cancelled successfully. Previous status: {oldStatus}");
 
                 return new OkObjectResult(new
                 {
                     success = true,
                     message = "Order cancelled successfully",
                     orderId = orderId,
-                    previousStatus = oldStatus
+                    previousStatus = oldStatus,
                 });
             }
             catch (Exception ex)
@@ -365,6 +369,7 @@ namespace Part2FunctionApp.Functions
             }
         }
 
+        // CUSTOMER: View own orders, MANAGER+: View orders for any customer
         [FunctionName("GetCustomerOrders")]
         public async Task<IActionResult> GetCustomerOrders(
             [HttpTrigger(AuthorizationLevel.Anonymous, "get", Route = "customers/{customerId}/orders")] HttpRequest req,
@@ -416,7 +421,7 @@ namespace Part2FunctionApp.Functions
                     customerId = customerId,
                     customerName = customer.FullName,
                     orders = orderViewModels,
-                    totalOrders = orderViewModels.Count
+                    totalOrders = orderViewModels.Count,
                 });
             }
             catch (Exception ex)
@@ -472,7 +477,8 @@ namespace Part2FunctionApp.Functions
                             ProductId = order.ProductId,
                             Status = order.Status,
                             CustomerName = customer.FullName,
-                            ProductName = product.Name
+                            ProductName = product.Name,
+                            ProcessedBy = "System Queue"
                         })
                     };
 

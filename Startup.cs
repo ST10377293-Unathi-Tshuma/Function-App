@@ -48,6 +48,12 @@ namespace Part2FunctionApp
                 return new QueueStorageService(connectionString, queueName);
             });
 
+            builder.Services.AddSingleton<TableStorageService<User>>(provider =>
+            {
+                var configuration = provider.GetRequiredService<IConfiguration>();
+                string connectionString = configuration["AzureStorageAccount:ConnectionString"];
+                return new TableStorageService<User>(connectionString, "Users");
+            });
 
             // File Share
             builder.Services.AddSingleton<FileShareStorageService>();

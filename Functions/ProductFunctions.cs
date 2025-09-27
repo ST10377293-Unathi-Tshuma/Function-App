@@ -4,11 +4,9 @@ using Microsoft.Azure.WebJobs;
 using Microsoft.Azure.WebJobs.Extensions.Http;
 using Microsoft.Extensions.Logging;
 using Newtonsoft.Json;
-using Part2FunctionApp.Helpers;
 using Part2FunctionApp.Models;
 using Part2FunctionApp.Services;
 using System;
-using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
 
@@ -19,53 +17,66 @@ namespace Part2FunctionApp.Functions
         private readonly TableStorageService<Product> _productTableService;
         private readonly BlobStorageService _blobStorageService;
         private readonly QueueStorageService _queueStorageService;
-        private readonly AuthService _authService;
-        private const string PARTITION_KEY = "Product";
 
-        public ProductFunctions(TableStorageService<Product> productTableService, BlobStorageService blobStorageService, QueueStorageService queueStorageService, AuthService authService)
+        public ProductFunctions(
+            TableStorageService<Product> productTableService,
+            BlobStorageService blobStorageService,
+            QueueStorageService queueStorageService)
         {
             _productTableService = productTableService;
             _blobStorageService = blobStorageService;
             _queueStorageService = queueStorageService;
-            _authService = authService;
         }
 
+        // PUBLIC - Get all products (no authentication required)
         [FunctionName("GetProducts")]
         public async Task<IActionResult> GetProducts(
             [HttpTrigger(AuthorizationLevel.Anonymous, "get", Route = "products")] HttpRequest req,
             ILogger log)
         {
-            log.LogInformation("Retrieving all products");
+            log.LogInformation("Retrieving all products (public access)");
 
-            var products = await _productTableService.GetAllEntities();
-
-            if(products == null)
+            try
             {
-                log.LogInformation("No products found.");
-                return new OkObjectResult(new { Message = "No products found.", Products = new Product[0] });
+                var products = await _productTableService.GetAllEntities();
+
+                if (products == null || !products.Any())
+                {
+                    log.LogInformation("No products found.");
+                    return new OkObjectResult(new { Message = "No products found.", Products = new ProductDTO[0] });
+                }
+
+                var productDtos = products.Select(p => new ProductDTO
+                {
+                    PartitionKey = p.PartitionKey,
+                    RowKey = p.RowKey,
+                    Timestamp = p.Timestamp,
+                    ETag = p.ETag.ToString(),
+                    Name = p.Name,
+                    Description = p.Description,
+                    Price = p.Price,
+                    ImageUrl = !string.IsNullOrEmpty(p.ImageUrl) ? _blobStorageService.GetBlobSasUrl(p.ImageUrl) : ""
+                }).ToList();
+
+                return new OkObjectResult(productDtos);
             }
-
-            var productdto = products.Select(p => new ProductDTO
+            catch (Exception ex)
             {
-                PartitionKey = p.PartitionKey, 
-                RowKey = p.RowKey, 
-                Timestamp = p.Timestamp, 
-                ETag = p.ETag.ToString(), 
-                Name = p.Name, 
-                Description = p.Description, 
-                Price = p.Price,
-                ImageUrl = _blobStorageService.GetBlobSasUrl(p.ImageUrl)
-            });
-            return new OkObjectResult(productdto);
+                log.LogError(ex, "Error retrieving products");
+                return new StatusCodeResult(StatusCodes.Status500InternalServerError);
+            }
         }
 
+        // PUBLIC - Get specific product (no authentication required)
         [FunctionName("GetProduct")]
         public async Task<IActionResult> GetProduct(
-            [HttpTrigger(AuthorizationLevel.Anonymous, "get", Route ="products/{productId}")] HttpRequest req, ILogger log, string productId)
+            [HttpTrigger(AuthorizationLevel.Anonymous, "get", Route = "products/{productId}")] HttpRequest req,
+            ILogger log,
+            string productId)
         {
-            log.LogInformation("Processing request to retrieve product with ID: {productId}", productId);
+            log.LogInformation("Processing request to retrieve product with ID: {productId} (public access)", productId);
 
-            if(string.IsNullOrWhiteSpace(productId))
+            if (string.IsNullOrWhiteSpace(productId))
             {
                 log.LogWarning("Product ID is missing or empty.");
                 return new BadRequestObjectResult("Product ID is required.");
@@ -73,190 +84,212 @@ namespace Part2FunctionApp.Functions
 
             try
             {
-                var product = await _productTableService.GetEntityAsync(PARTITION_KEY, productId);
+                var product = await _productTableService.GetEntityAsync("Product", productId);
 
-                if(product == null)
+                if (product == null)
                 {
                     log.LogWarning("Product with ID {productId} not found.", productId);
                     return new NotFoundObjectResult($"Product with ID {productId} not found.");
                 }
 
-                return new OkObjectResult(product);
+                var productDto = new ProductDTO
+                {
+                    PartitionKey = product.PartitionKey,
+                    RowKey = product.RowKey,
+                    Timestamp = product.Timestamp,
+                    ETag = product.ETag.ToString(),
+                    Name = product.Name,
+                    Description = product.Description,
+                    Price = product.Price,
+                    ImageUrl = !string.IsNullOrEmpty(product.ImageUrl) ? _blobStorageService.GetBlobSasUrl(product.ImageUrl) : ""
+                };
+
+                return new OkObjectResult(productDto);
             }
-            catch(Exception ex)
+            catch (Exception ex)
             {
                 log.LogError(ex, "Error retrieving product with ID {productId}.", productId);
                 return new StatusCodeResult(StatusCodes.Status500InternalServerError);
             }
-            
         }
 
+        // MANAGER+ ONLY - Create product
         [FunctionName("CreateProduct")]
-        public async Task<IActionResult> CreateProduct([HttpTrigger(AuthorizationLevel.Anonymous, "post", Route = "products")] HttpRequest req, ILogger log)
+        public async Task<IActionResult> CreateProduct(
+            [HttpTrigger(AuthorizationLevel.Anonymous, "post", Route = "products")] HttpRequest req,
+            ILogger log)
         {
             log.LogInformation("Processing product creation request");
 
-            //Authorization Check -- Require Manager role or higher
-            var (authorized, user, errorResult) = AuthorizationHelper.AuthorizeRequest(
-                req, _authService, "Manager", log
-                );
-
-            if (!authorized)
+            try
             {
-                log.LogWarning("Unathorized attempt to create product");
-                return errorResult;
-            }
+                // Read form data
+                var formData = await req.ReadFormAsync();
+                var partitionKey = "Product";
+                var rowKey = Guid.NewGuid().ToString();
 
-            log.LogInformation($"Manager/Admin {user.Username} ({user.Role}) creating product");
-
-            //Read form data
-            var formData = await req.ReadFormAsync();
-            var rowKey = Guid.NewGuid().ToString();
-
-            var product = new Product
-            {
-                PartitionKey = PARTITION_KEY,
-                RowKey = rowKey,
-                Name = formData["name"],
-                Description = formData["description"],
-                Price = int.TryParse(formData["price"], out var price) ? price : 0,
-            };
-
-            log.LogInformation($"Creating student with partitionkey: {PARTITION_KEY}, rowkey: {rowKey}");
-
-            // handle your photo if uploaded
-            var imageFile = formData.Files.FirstOrDefault();
-            if (imageFile != null && imageFile.Length > 0)
-            {
-                using var imageStream = imageFile.OpenReadStream();
-                var blobName = await _blobStorageService.UploadImageAsync(imageStream, imageFile.FileName);
-                product.ImageUrl = blobName;
-            }
-
-            if (string.IsNullOrEmpty(product.PartitionKey) || string.IsNullOrEmpty(product.RowKey))
-            {
-                return new BadRequestObjectResult("PartitionKey and RowKey are required.");
-            }
-
-            await _productTableService.UpsertEntityAsync(product);
-            //Send a message to the queue for further processing
-            var auditLog = new AuditLog
-            {
-                TableName = "Products",
-                Action = "Create",
-                DataSnapshot = JsonConvert.SerializeObject(new
+                var product = new Product
                 {
-                    ProductId = product.RowKey,
-                    product.Name,
-                    product.Price,
-                    HasImage = !string.IsNullOrEmpty(product.ImageUrl),
-                    createdBy = user.Username, 
-                    CreatedByRole = user.Role,
-                    CreatedByUserId = user.UserId,
-                })
-            };
-            await _queueStorageService.SendLogEntryAsync(auditLog);
+                    PartitionKey = partitionKey,
+                    RowKey = rowKey,
+                    Name = formData["name"],
+                    Description = formData["description"],
+                    Price = int.TryParse(formData["price"], out var price) ? price : 0,
+                };
 
-            return new OkObjectResult(new
+                // Validation
+                if (string.IsNullOrWhiteSpace(product.Name))
+                {
+                    return new BadRequestObjectResult("Product name is required");
+                }
+
+                if (product.Price <= 0)
+                {
+                    return new BadRequestObjectResult("Valid price is required");
+                }
+
+                log.LogInformation($"Creating product with partitionkey: {partitionKey}, rowkey: {rowKey}");
+
+                // Handle image upload if provided
+                var imageFile = formData.Files.FirstOrDefault();
+                if (imageFile != null && imageFile.Length > 0)
+                {
+                    using var imageStream = imageFile.OpenReadStream();
+                    var blobName = await _blobStorageService.UploadImageAsync(imageStream, imageFile.FileName);
+                    product.ImageUrl = blobName;
+                }
+
+                await _productTableService.UpsertEntityAsync(product);
+
+                // Enhanced audit log with user information
+                var auditLog = new AuditLog
+                {
+                    TableName = "Products",
+                    Action = "Create",
+                    DataSnapshot = JsonConvert.SerializeObject(new
+                    {
+                        ProductId = product.RowKey,
+                        product.Name,
+                        product.Price,
+                        HasImage = !string.IsNullOrEmpty(product.ImageUrl),
+                    })
+                };
+                await _queueStorageService.SendLogEntryAsync(auditLog);
+
+
+                return new OkObjectResult(new
+                {
+                    success = true,
+                    message = "Product created successfully",
+                    productId = product.RowKey,
+                    productName = product.Name,
+                    imageUrl = !string.IsNullOrEmpty(product.ImageUrl) ? _blobStorageService.GetBlobSasUrl(product.ImageUrl) : "",
+                });
+            }
+            catch (Exception ex)
             {
-                success = true,
-                message = "Product created successfully",
-                productId = product.RowKey,
-                productName = product.Name,
-                imageUrl = product.ImageUrl
-            });
+                log.LogError(ex, "Error creating product");
+                return new StatusCodeResult(StatusCodes.Status500InternalServerError);
+            }
         }
 
+        // MANAGER+ ONLY - Update product
         [FunctionName("UpdateProduct")]
-        public async Task<IActionResult> Run(
+        public async Task<IActionResult> UpdateProduct(
             [HttpTrigger(AuthorizationLevel.Anonymous, "put", Route = "products/{productId}")] HttpRequest req,
             string productId,
             ILogger log)
         {
-            log.LogInformation($"Processing request to update product with PartitionKey: Product, RowKey: {productId}");
+            log.LogInformation($"Processing request to update product with ID: {productId}");
 
-            var (authorized, user, errorResult) = AuthorizationHelper.AuthorizeRequest(
-                req, _authService, "Manager", log);
-            if (!authorized)
+            try
             {
-                log.LogWarning($"Unauthorized attempt to update product {productId}");
-                return errorResult;
-            }
+                // Read form data
+                var formData = await req.ReadFormAsync();
+                var name = formData["name"];
+                var description = formData["description"];
+                var priceString = formData["price"];
 
-            log.LogInformation($"Manager/Admin {user.Username} ({user.Role}) updating product {productId}");
-
-
-            // Read form data
-            var formData = await req.ReadFormAsync();
-            var name = formData["name"];
-            var description = formData["description"];
-            var priceString = formData["price"];
-            var price = int.Parse(priceString);
-
-            // Retrieve the existing product
-            var existingProduct = await _productTableService.GetEntityAsync(PARTITION_KEY, productId);
-            if (existingProduct == null)
-            {
-                log.LogWarning($"Product with RowKey {productId} not found.");
-                return new NotFoundObjectResult(new { success = false, message = "Product not found" });
-            }
-
-            // Update only provided fields
-            if (!string.IsNullOrEmpty(name)) existingProduct.Name = name;
-            if (!string.IsNullOrEmpty(description)) existingProduct.Description = description;
-            if (price > 0) existingProduct.Price = price;
-
-            // Handle optional image upload
-            if (formData.Files.Count > 0)
-            {
-                var imageFile = formData.Files.First();
-                using var imageStream = imageFile.OpenReadStream();
-                var blobName = await _blobStorageService.UploadImageAsync(imageStream, imageFile.FileName);
-                existingProduct.ImageUrl = blobName;
-            }
-
-         
-            // Save updated product
-            await _productTableService.UpsertEntityAsync(existingProduct);
-
-            // Create DTO
-            var updatedProductDto = new ProductDTO
-            {
-                PartitionKey = existingProduct.PartitionKey,
-                RowKey = existingProduct.RowKey,
-                Timestamp = existingProduct.Timestamp,
-                ETag = existingProduct.ETag.ToString(),
-                Name = existingProduct.Name,
-                Description = existingProduct.Description,
-                Price = existingProduct.Price,
-                ImageUrl = existingProduct.ImageUrl
-            };
-
-            // Audit log
-            var audit = new AuditLog
-            {
-                TableName = "Products",
-                Action = "Update",
-                DataSnapshot = JsonConvert.SerializeObject(new
+                // Retrieve the existing product
+                var existingProduct = await _productTableService.GetEntityAsync("Product", productId);
+                if (existingProduct == null)
                 {
-                    ProductId = productId,
-                    UpdatedFields = new
-                    {
-                        Name = !string.IsNullOrEmpty(name),
-                        Description = !string.IsNullOrEmpty(description),
-                        Price = int.TryParse(priceString, out _),
-                        ImageUpdated = formData.Files.Count > 0
-                    },
-                    UpdatedBy = user.Username,
-                    UpdatedByRole = user.Role,
-                    UpdatedByUserId = user.UserId
-                }),
-                Timestamp = DateTime.UtcNow
-            };
-            await _queueStorageService.SendLogEntryAsync(audit);
+                    log.LogWarning($"Product with RowKey {productId} not found.");
+                    return new NotFoundObjectResult(new { success = false, message = "Product not found" });
+                }
 
-            log.LogInformation($"Product {productId} updated successfully.");
-            return new OkObjectResult(updatedProductDto);
+                // Store old image URL for potential cleanup
+                var oldImageUrl = existingProduct.ImageUrl;
+
+                // Update only provided fields
+                if (!string.IsNullOrEmpty(name)) existingProduct.Name = name;
+                if (!string.IsNullOrEmpty(description)) existingProduct.Description = description;
+                if (int.TryParse(priceString, out var price) && price > 0) existingProduct.Price = price;
+
+                // Handle optional image upload
+                if (formData.Files.Count > 0)
+                {
+                    // Delete old image if it exists
+                    if (!string.IsNullOrEmpty(oldImageUrl))
+                    {
+                        await _blobStorageService.DeleteBlobAsync(oldImageUrl);
+                    }
+
+                    var imageFile = formData.Files.First();
+                    using var imageStream = imageFile.OpenReadStream();
+                    var blobName = await _blobStorageService.UploadImageAsync(imageStream, imageFile.FileName);
+                    existingProduct.ImageUrl = blobName;
+                }
+
+                // Save updated product
+                await _productTableService.UpsertEntityAsync(existingProduct);
+
+                // Create DTO for response
+                var updatedProductDto = new ProductDTO
+                {
+                    PartitionKey = existingProduct.PartitionKey,
+                    RowKey = existingProduct.RowKey,
+                    Timestamp = existingProduct.Timestamp,
+                    ETag = existingProduct.ETag.ToString(),
+                    Name = existingProduct.Name,
+                    Description = existingProduct.Description,
+                    Price = existingProduct.Price,
+                    ImageUrl = !string.IsNullOrEmpty(existingProduct.ImageUrl) ? _blobStorageService.GetBlobSasUrl(existingProduct.ImageUrl) : ""
+                };
+
+                // Enhanced audit log
+                var audit = new AuditLog
+                {
+                    TableName = "Products",
+                    Action = "Update",
+                    DataSnapshot = JsonConvert.SerializeObject(new
+                    {
+                        ProductId = productId,
+                        UpdatedFields = new
+                        {
+                            Name = !string.IsNullOrEmpty(name),
+                            Description = !string.IsNullOrEmpty(description),
+                            Price = int.TryParse(priceString, out _),
+                            ImageUpdated = formData.Files.Count > 0
+                        },
+                    }),
+                    Timestamp = DateTime.UtcNow
+                };
+                await _queueStorageService.SendLogEntryAsync(audit);
+
+
+                return new OkObjectResult(new
+                {
+                    success = true,
+                    message = "Product updated successfully",
+                    product = updatedProductDto,
+                });
+            }
+            catch (Exception ex)
+            {
+                log.LogError(ex, $"Error updating product {productId}");
+                return new StatusCodeResult(StatusCodes.Status500InternalServerError);
+            }
         }
 
         [FunctionName("DeleteProduct")]
@@ -265,67 +298,62 @@ namespace Part2FunctionApp.Functions
             string productId,
             ILogger log)
         {
-            log.LogInformation($"Processing request to delete product with PartitionKey: Product, RowKey: {productId}");
-
-            // AUTHORIZATION CHECK - Require Admin role
-            var (authorized, user, errorResult) = AuthorizationHelper.AuthorizeRequest(
-                req, _authService, "Admin", log);
-            if (!authorized)
-            {
-                log.LogWarning($"Unauthorized attempt to delete product {productId}");
-                return errorResult;
-            }
-
-            log.LogInformation($"Admin {user.Username} deleting product {productId}");
+            log.LogInformation($"Processing request to delete product with ID: {productId}");
 
             if (string.IsNullOrWhiteSpace(productId))
             {
                 return new BadRequestObjectResult(new { success = false, message = "Product ID is required" });
             }
 
-            // Retrieve the existing product
-            var existingProduct = await _productTableService.GetEntityAsync("Product", productId);
-            if (existingProduct == null)
+            try
             {
-                log.LogWarning($"Product with RowKey {productId} not found.");
-                return new NotFoundObjectResult(new { success = false, message = "Product not found" });
-            }
-
-            if (!string.IsNullOrEmpty(existingProduct.ImageUrl))
-            {
-                await _blobStorageService.DeleteBlobAsync(existingProduct.ImageUrl);
-            }
-
-            // Delete the product
-            await _productTableService.DeleteEntityAsync(existingProduct.PartitionKey, existingProduct.RowKey);
-
-            // Send audit log
-            var audit = new AuditLog
-            {
-                TableName = "Products",
-                Action = "Deleted",
-                DataSnapshot = JsonConvert.SerializeObject(new
+                // Retrieve the existing product
+                var existingProduct = await _productTableService.GetEntityAsync("Product", productId);
+                if (existingProduct == null)
                 {
-                    ProductId = existingProduct.RowKey,
-                    ProductName = existingProduct.Name,
-                    Price = existingProduct.Price,
-                    ImageDeleted = !string.IsNullOrEmpty(existingProduct.ImageUrl),
-                    DeletedBy = user.Username,
-                    DeletedByRole = user.Role,
-                    DeletedByUserId = user.UserId
-                }),
-                Timestamp = DateTime.UtcNow
-            };
-            await _queueStorageService.SendLogEntryAsync(audit);
+                    log.LogWarning($"Product with RowKey {productId} not found.");
+                    return new NotFoundObjectResult(new { success = false, message = "Product not found" });
+                }
 
-            log.LogInformation($"Product {productId} deleted successfully.");
+                // Delete associated image from blob storage
+                if (!string.IsNullOrEmpty(existingProduct.ImageUrl))
+                {
+                    await _blobStorageService.DeleteBlobAsync(existingProduct.ImageUrl);
+                }
 
-            return new OkObjectResult(new
+                // Delete the product
+                await _productTableService.DeleteEntityAsync(existingProduct.PartitionKey, existingProduct.RowKey);
+
+                // Enhanced audit log
+                var audit = new AuditLog
+                {
+                    TableName = "Products",
+                    Action = "Deleted",
+                    DataSnapshot = JsonConvert.SerializeObject(new
+                    {
+                        ProductId = existingProduct.RowKey,
+                        ProductName = existingProduct.Name,
+                        Price = existingProduct.Price,
+                        ImageDeleted = !string.IsNullOrEmpty(existingProduct.ImageUrl),
+                    }),
+                    Timestamp = DateTime.UtcNow
+                };
+                await _queueStorageService.SendLogEntryAsync(audit);
+
+                return new OkObjectResult(new
+                {
+                    success = true,
+                    message = "Product deleted successfully",
+                    deletedProductId = productId,
+                    productName = existingProduct.Name,
+                });
+            }
+            catch (Exception ex)
             {
-                success = true,
-                message = "Product deleted successfully",
-                deletedProductId = productId
-            });
+                log.LogError(ex, $"Error deleting product {productId}");
+                return new StatusCodeResult(StatusCodes.Status500InternalServerError);
+            }
         }
+        
     }
 }
