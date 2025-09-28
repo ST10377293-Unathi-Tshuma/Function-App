@@ -27,8 +27,6 @@ namespace Part2FunctionApp
                 return new TableStorageService<Customer>(connectionString, "Customers");
             });
 
-            builder.Services.AddSingleton<FileShareStorageService>();
-
             builder.Services.AddSingleton<TableStorageService<Product>>(provider =>
             {
                 var configuration = provider.GetRequiredService<IConfiguration>();
